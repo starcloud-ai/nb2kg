@@ -18,9 +18,10 @@ from ipython_genutils.py3compat import cast_unicode
 from jupyter_client.session import Session
 from traitlets.config.configurable import LoggingConfigurable
 
-# TODO: Find a better way to specify global configuration options 
+from .managers import RemoteKernelManager
+
+# TODO: Find a better way to specify global configuration options
 # for a server extension.
-KG_URL = os.getenv('KG_URL', 'http://127.0.0.1:8888/')
 KG_HEADERS = json.loads(os.getenv('KG_HEADERS', '{}'))
 KG_HEADERS.update({
     'Authorization': 'token {}'.format(os.getenv('KG_AUTH_TOKEN', ''))
@@ -102,6 +103,7 @@ class WebSocketChannelsHandler(WebSocketHandler, IPythonHandler):
         self.client.on_close()
         super(WebSocketChannelsHandler, self).on_close()
 
+
 class KernelGatewayWSClient(LoggingConfigurable):
     '''Proxy web socket connection to a kernel gateway.'''
 
@@ -111,18 +113,21 @@ class KernelGatewayWSClient(LoggingConfigurable):
 
     @gen.coroutine
     def _connect(self, kernel_id):
+        server = RemoteKernelManager.get_kernel_server(kernel_id)
+        host = 'ws://{}:{}'.format(server['ip'], server['port'])
+
         ws_url = url_path_join(
-            os.getenv('KG_WS_URL', KG_URL.replace('http', 'ws')),
-            '/api/kernels', 
+            host,
+            '/api/kernels',
             url_escape(kernel_id),
             'channels'
         )
         self.log.info('Connecting to {}'.format(ws_url))
         parameters = {
-          "headers" : KG_HEADERS,
-          "validate_cert" : VALIDATE_KG_CERT,
-          "connect_timeout" : KG_CONNECT_TIMEOUT,
-          "request_timeout" : KG_REQUEST_TIMEOUT
+            "headers": KG_HEADERS,
+            "validate_cert": VALIDATE_KG_CERT,
+            "connect_timeout": KG_CONNECT_TIMEOUT,
+            "request_timeout": KG_REQUEST_TIMEOUT
         }
         if KG_HTTP_USER:
             parameters["auth_username"] = KG_HTTP_USER
@@ -151,7 +156,8 @@ class KernelGatewayWSClient(LoggingConfigurable):
         '''Read messages from server.'''
         while True:
             message = yield self.ws.read_message()
-            if message is None: break # TODO: handle socket close
+            if message is None:
+                break  # TODO: handle socket close
             callback(message)
 
     def on_open(self, kernel_id, message_callback, **kwargs):
@@ -182,10 +188,10 @@ class KernelGatewayWSClient(LoggingConfigurable):
         '''Web socket closed event.'''
         self._disconnect()
 
-#-----------------------------------------------------------------------------
-# kernel handlers
-#-----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# kernel handlers
+# -----------------------------------------------------------------------------
 class MainKernelHandler(APIHandler):
     """Replace default MainKernelHandler to enable async lookup of kernels."""
 
@@ -210,13 +216,18 @@ class MainKernelHandler(APIHandler):
         else:
             model.setdefault('name', km.default_kernel_name)
 
-        kernel_id = yield gen.maybe_future(km.start_kernel(kernel_name=model['name']))
+        kernel_id = yield gen.maybe_future(km.start_kernel(kernel_name=model['name'], server_name=model.get('server_name')))
+        if kernel_id is None:
+            self.set_status(422)
+            self.finish()
+
         # This is now an async operation
         model = yield gen.maybe_future(km.kernel_model(kernel_id))
         location = url_path_join(self.base_url, 'api', 'kernels', url_escape(kernel_id))
         self.set_header('Location', location)
         self.set_status(201)
         self.finish(json.dumps(model))
+
 
 class KernelHandler(APIHandler):
     """Replace default KernelHandler to enable async lookup of kernels."""
@@ -240,6 +251,7 @@ class KernelHandler(APIHandler):
         yield gen.maybe_future(km.shutdown_kernel(kernel_id))
         self.set_status(204)
         self.finish()
+
 
 class KernelActionHandler(APIHandler):
     """Replace default KernelActionHandler to enable async lookup of kernels."""
@@ -265,10 +277,10 @@ class KernelActionHandler(APIHandler):
                 self.write(json.dumps(model))
         self.finish()
 
-#-----------------------------------------------------------------------------
-# kernel spec handlers
-#-----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# kernel spec handlers
+# -----------------------------------------------------------------------------
 class MainKernelSpecHandler(APIHandler):
     @web.authenticated
     @json_errors
@@ -281,6 +293,7 @@ class MainKernelSpecHandler(APIHandler):
             spec['resources'] = {}
         self.set_header("Content-Type", 'application/json')
         self.finish(json.dumps(kernel_specs))
+
 
 class KernelSpecHandler(APIHandler):
     @web.authenticated
@@ -296,12 +309,69 @@ class KernelSpecHandler(APIHandler):
         self.set_header("Content-Type", 'application/json')
         self.finish(json.dumps(kernel_spec))
 
-#-----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# remote kernel handlers
+# -----------------------------------------------------------------------------
+from .managers import KernelServerManager
+
+
+class MainKernelServerHandler(APIHandler):
+
+    @web.authenticated
+    @json_errors
+    @gen.coroutine
+    def post(self):
+        ''' new remote kernel '''
+        model = self.get_json_body()
+        yield gen.maybe_future(KernelServerManager().create_server(model))
+        self.set_status(201)
+        self.finish()
+
+
+class KernelServerHandler(APIHandler):
+
+    @web.authenticated
+    @json_errors
+    @gen.coroutine
+    def get(self, server_name):
+        ''' get kernel server '''
+        yield gen.maybe_future(KernelServerManager.get_server(server_name))
+        self.set_status(204)
+        self.finish()
+
+
+class RemoteKernelHandler(APIHandler):
+
+    @web.authenticated
+    @json_errors
+    @gen.coroutine
+    def post(self, server_name):
+        ''' new remote kernel '''
+        km = self.kernel_manager
+        model = self.get_json_body()
+        kernel_name = model.get('kernel_name') if model is not None else None
+
+        kernel_id = yield gen.maybe_future(km.start_kernel(server_name=server_name, kernel_name=kernel_name))
+        if kernel_id is None:
+            self.set_status(422)
+            self.finish()
+
+        # This is now an async operation
+        model = yield gen.maybe_future(km.kernel_model(kernel_id))
+        location = url_path_join(self.base_url, 'api', 'kernels', url_escape(kernel_id))
+        self.set_header('Location', location)
+        self.set_status(201)
+        self.finish(json.dumps(model))
+
+
+# -----------------------------------------------------------------------------
 # URL to handler mappings
-#-----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 from notebook.services.kernels.handlers import _kernel_id_regex, _kernel_action_regex
 from notebook.services.kernelspecs.handlers import kernel_name_regex
+kernel_gateway_server_regex = r"(?P<server_name>\w+)"
 
 default_handlers = [
     (r"/api/kernels", MainKernelHandler),
@@ -312,4 +382,7 @@ default_handlers = [
     (r"/api/kernelspecs/%s" % kernel_name_regex, KernelSpecHandler),
     # TODO: support kernel spec resources
     # (r"/kernelspecs/%s/(?P<path>.*)" % kernel_name_regex, KernelSpecResourceHandler),
+    (r"/api/kernel-servers", MainKernelServerHandler),
+    (r"/api/kernel-servers/%s" % kernel_gateway_server_regex, KernelServerHandler),
+    (r"/api/kernel-servers/%s/kernels" % kernel_gateway_server_regex, RemoteKernelHandler),
 ]
